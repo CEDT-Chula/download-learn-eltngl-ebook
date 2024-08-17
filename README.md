@@ -19,6 +19,6 @@ This is for the sake of conveniency only. You must have brought ebook in order t
 # Usage
   1. Make .env
 make .env file in root with structure like [.env.example](https://github.com/CEDT-Chula/download-learn-eltngl-ebook/blob/main/.env.example)
-  2. Run fetcher.go
-```go run fetcher.go```
+  2. Run main.go
+```go run main.go```
   3. result pdf is in <root>/output/downloaded.pdf
