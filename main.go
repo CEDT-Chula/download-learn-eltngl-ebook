@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"sort"
 	"sync"
 
 	"github.com/caarlos0/env"
@@ -70,20 +71,20 @@ func findPageFileNames() ([]string, error) {
 	return matches, nil
 }
 
-func fetchPage(pageUri string) (*pdf.PdfPage, error) {
+func fetchPage(pageUri string, index int) (*pdf.PdfPage, int, error) {
 	log.WithField("url", pageUri).Info("Fetching page")
 
 	response, err := http.Get(pageUri)
 	if err != nil {
 		log.WithError(err).Error("Failed to fetch page")
-		return nil, err
+		return nil, index, err
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
 		log.WithError(err).Error("Failed to read page")
-		return nil, err
+		return nil, index, err
 	}
 
 	body = bytes.Replace(body, []byte("%ADF-1.6"), []byte("%PDF-1.6"), 1)
@@ -92,28 +93,36 @@ func fetchPage(pageUri string) (*pdf.PdfPage, error) {
 	currentPdf, err := pdf.NewPdfReader(bodyBytes)
 	if err != nil {
 		log.WithError(err).Error("Failed to read PDF")
-		return nil, err
+		return nil, index, err
 	}
 
 	page, err := currentPdf.GetPage(1)
 	if err != nil {
 		log.WithError(err).Error("Failed to get page from PDF")
-		return nil, err
+		return nil, index, err
 	}
 
 	log.WithField("page_number", currentPdf.GetNumPages).Info("Successfully fetched page")
-	return page, nil
+	return page, index, nil
 }
 
-func worker(jobs <-chan string, results chan<- *pdf.PdfPage, errors chan<- error, wg *sync.WaitGroup) {
+type PageResult struct {
+	Page  *pdf.PdfPage
+	Index int
+}
+
+func worker(id int, jobs <-chan struct {
+	uri   string
+	index int
+}, results chan<- PageResult, errors chan<- error, wg *sync.WaitGroup) {
 	defer wg.Done()
-	for pageUri := range jobs {
-		page, err := fetchPage(pageUri)
+	for job := range jobs {
+		page, index, err := fetchPage(job.uri, job.index)
 		if err != nil {
 			errors <- err
 			continue
 		}
-		results <- page
+		results <- PageResult{Page: page, Index: index}
 	}
 }
 
@@ -125,24 +134,29 @@ func download() error {
 
 	numWorkers := 10
 	pdfWriter := pdf.NewPdfWriter()
+	pagesList := make([]PageResult, 0, len(pageFileNames)-environment.START_PAGE)
 
-	jobs := make(chan string, len(pageFileNames)-environment.START_PAGE)
-	results := make(chan *pdf.PdfPage, len(pageFileNames)-environment.START_PAGE)
+	jobs := make(chan struct {
+		uri   string
+		index int
+	}, len(pageFileNames)-environment.START_PAGE)
+	results := make(chan PageResult, len(pageFileNames)-environment.START_PAGE)
 	errors := make(chan error, len(pageFileNames)-environment.START_PAGE)
 
 	var wg sync.WaitGroup
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
-			worker((<-chan string)(jobs), chan<- *pdf.PdfPage(results), chan<- error(errors), &wg)
-		}()
+		go worker(i, jobs, results, errors, &wg)
 	}
 
 	// Enqueue jobs
-	for _, pageFilename := range pageFileNames[environment.START_PAGE:] {
+	for index, pageFilename := range pageFileNames[environment.START_PAGE:] {
 		pageUri := fmt.Sprintf(PAGE_URI_PATTERN, environment.BOOK_ID, pageFilename)
-		jobs <- pageUri
+		jobs <- struct {
+			uri   string
+			index int
+		}{uri: pageUri, index: index}
 	}
 	close(jobs)
 
@@ -153,16 +167,23 @@ func download() error {
 		close(errors)
 	}()
 
-	for i := 0; i < len(pageFileNames)-environment.START_PAGE; i++ {
-		select {
-		case err := <-errors:
-			log.WithError(err).Error("Error while fetching pages")
-		case page := <-results:
-			pdfWriter.AddPage(page)
-		}
+	// Collect results
+	for result := range results {
+		pagesList = append(pagesList, result)
 	}
 
+	// Sort pages by index
+	sort.Slice(pagesList, func(i, j int) bool {
+		return pagesList[i].Index < pagesList[j].Index
+	})
+
+	// Write pages to PDF
 	log.Info("Writing pages to PDF")
+	for _, pageResult := range pagesList {
+		pdfWriter.AddPage(pageResult.Page)
+	}
+
+	// Save PDF
 	err = os.MkdirAll("output", os.ModePerm)
 	if err != nil {
 		log.WithError(err).Error("Failed to create output directory")
