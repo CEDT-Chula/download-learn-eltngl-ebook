@@ -111,7 +111,7 @@ type PageResult struct {
 	Index int
 }
 
-func worker(id int, jobs <-chan struct {
+func worker(jobs <-chan struct {
 	uri   string
 	index int
 }, results chan<- PageResult, errors chan<- error, wg *sync.WaitGroup) {
@@ -147,7 +147,12 @@ func download() error {
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go worker(i, jobs, results, errors, &wg)
+		go func() {
+			worker((<-chan struct {
+				uri   string
+				index int
+			})(jobs), chan<- PageResult(results), chan<- error(errors), &wg)
+		}()
 	}
 
 	// Enqueue jobs
@@ -172,7 +177,10 @@ func download() error {
 		pagesList = append(pagesList, result)
 	}
 
-	// Sort pages by index
+	/*
+		 Sort pages by index
+		This is necessary because the pages are fetched concurrently
+	*/
 	sort.Slice(pagesList, func(i, j int) bool {
 		return pagesList[i].Index < pagesList[j].Index
 	})
