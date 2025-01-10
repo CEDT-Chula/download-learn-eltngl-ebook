@@ -2,14 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
 	"regexp"
 	"sync"
-
-	"runtime"
 
 	"github.com/caarlos0/env"
 	"github.com/joho/godotenv"
@@ -18,19 +17,9 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-type TestError struct{}
-
-func (t TestError) Error() string {
-	return "boom"
-}
-
 type EnvSchema struct {
 	BOOK_ID    string `env:"BOOK_ID"`
 	START_PAGE int    `env:"START_PAGE"`
-}
-
-type Update struct {
-	Uri *string
 }
 
 type Job struct {
@@ -42,9 +31,18 @@ var (
 	environment EnvSchema
 	log         = logrus.New()
 
-	fetchingDone  chan bool = make(chan bool, 1)
-	fetchingError error
-	wg            sync.WaitGroup
+	numWorkers   int       = 10
+	fetchingDone chan bool = make(chan bool, 1)
+	updates      chan bool = make(chan bool, numWorkers)
+	wg           sync.WaitGroup
+	bar          *pterm.ProgressbarPrinter
+
+	workerCtx, workerCancel = context.WithCancelCause(context.Background())
+)
+
+const (
+	DATA_URI_PATTERN = "https://learn.eltngl.com/cdn_proxy/%s/data.js"
+	PAGE_URI_PATTERN = "https://learn.eltngl.com/cdn_proxy/%s/media/%s"
 )
 
 func init() {
@@ -63,9 +61,6 @@ func loadEnv() {
 		log.WithError(err).Fatal("Failed to parse environment variables")
 	}
 }
-
-const DATA_URI_PATTERN = "https://learn.eltngl.com/cdn_proxy/%s/data.js"
-const PAGE_URI_PATTERN = "https://learn.eltngl.com/cdn_proxy/%s/media/%s"
 
 func findPageFileNames() ([]string, error) {
 	dataUri := fmt.Sprintf(DATA_URI_PATTERN, environment.BOOK_ID)
@@ -91,25 +86,19 @@ func findPageFileNames() ([]string, error) {
 	return matches, nil
 }
 
-func fetchPage(pageUri string, index int, update chan Update, bar *pterm.ProgressbarPrinter) (*pdf.PdfPage, error) {
-	update <- Update{Uri: &pageUri}
-
+func fetchPage(pageUri string, index int) (*pdf.PdfPage, error) {
 	response, err := http.Get(pageUri)
 	if err != nil {
-		if !isExiting {
-			bar.Stop()
-			log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to fetch page")
-		}
+		bar.Stop()
+		log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to fetch page")
 		return nil, err
 	}
 	defer response.Body.Close()
 
 	body, err := io.ReadAll(response.Body)
 	if err != nil {
-		if !isExiting {
-			bar.Stop()
-			log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to read page")
-		}
+		bar.Stop()
+		log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to read page")
 		return nil, err
 	}
 
@@ -118,49 +107,49 @@ func fetchPage(pageUri string, index int, update chan Update, bar *pterm.Progres
 
 	currentPdf, err := pdf.NewPdfReader(bodyBytes)
 	if err != nil {
-		if !isExiting {
-			bar.Stop()
-			log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to read PDF")
-		}
+		bar.Stop()
+		log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to read PDF")
 		return nil, err
 	}
 
 	page, err := currentPdf.GetPage(1)
 	if err != nil {
-		if !isExiting {
-			bar.Stop()
-			log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to get page from PDF")
-		}
+		bar.Stop()
+		log.WithFields(logrus.Fields{"index": index, "uri": pageUri}).Error("Failed to get page from PDF")
 		return nil, err
 	}
-
 	return page, nil
 }
 
 var isExiting bool = false
 
-func worker(jobs chan Job, results []*pdf.PdfPage, bar *pterm.ProgressbarPrinter, wg *sync.WaitGroup, update chan Update) {
+func worker(jobs <-chan Job, results []*pdf.PdfPage) {
 	defer wg.Done()
-	if fetchingError != nil {
+	if workerCtx.Err() != nil {
 		return
 	}
-	for job := range jobs {
-		if fetchingError != nil {
+	for {
+		select {
+		case <-workerCtx.Done():
 			return
-		}
-		page, err := fetchPage(job.uri, job.index, update, bar)
-		if err != nil {
-			fetchingError = err
-			if !isExiting {
-				log.WithFields(logrus.Fields{
-					"uri": job.uri, "index": job.index,
-				}).Errorf("Detecting error, exiting..")
+		case job, ok := <-jobs:
+			if !ok {
+				return
 			}
-			isExiting = true
-			return
+			page, err := fetchPage(job.uri, job.index)
+			if err != nil {
+				if !isExiting {
+					log.WithFields(logrus.Fields{
+						"uri": job.uri, "index": job.index,
+					}).Errorf("Detecting error, exiting..")
+				}
+				isExiting = true
+				workerCancel(err)
+				return
+			}
+			results[job.index] = page
+			updates <- true
 		}
-		results[job.index] = page
-		update <- Update{Uri: nil}
 	}
 }
 
@@ -170,38 +159,38 @@ func download() error {
 		return err
 	}
 
-	numWorkers := runtime.NumCPU()
 	pdfWriter := pdf.NewPdfWriter()
 	numPages := len(pageFileNames) - environment.START_PAGE
 
 	jobs := make(chan Job, numPages)
 	results := make([]*pdf.PdfPage, numPages)
 
-	var update chan Update = make(chan Update, numWorkers)
-
 	pterm.DefaultSection.Println("Task Progress")
 
-	bar, _ := pterm.DefaultProgressbar.WithTotal(numPages).Start()
+	bar, _ = pterm.DefaultProgressbar.WithTotal(numPages).Start()
 
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
-		go func() {
-			worker(jobs, results, bar, &wg, update)
-		}()
+		go worker(jobs, results)
 	}
 
 	go func() {
-		for updateEvent := range update {
-			if fetchingError != nil {
-				break
-			}
-			if updateEvent.Uri != nil {
-				bar.UpdateTitle(fmt.Sprintf("Fetching data: %s", *updateEvent.Uri))
-			} else {
-				bar.Add(1)
+		defer func() { fetchingDone <- true }()
+		for {
+			select {
+			case <-workerCtx.Done():
+				{
+					return
+				}
+			case _, ok := <-updates:
+				{
+					if !ok {
+						return
+					}
+					bar.Add(1)
+				}
 			}
 		}
-		fetchingDone <- true
 	}()
 
 	// Enqueue jobs
@@ -213,11 +202,11 @@ func download() error {
 
 	// Wait for workers to finish
 	wg.Wait()
-	close(update)
+	close(updates)
 	<-fetchingDone
 	bar.Stop()
-	if fetchingError != nil {
-		log.WithError(fetchingError).Fatal("Error during fetching")
+	if workerCtx.Err() != nil {
+		log.WithError(context.Cause(workerCtx)).Fatal("Error during fetching")
 	}
 
 	// Write pages to PDF
